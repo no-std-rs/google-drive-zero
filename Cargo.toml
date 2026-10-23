@@ -1,0 +1,32 @@
+[package]
+name = "google-drive-zero"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/no-std-rs/google-drive-zero"
+readme = "README.md"
+keywords = ["google-drive", "no-std", "streaming", "cloud", "resumable"]
+categories = ["no-std", "network-programming", "api-bindings"]
+description = "no_std Google Drive v3 client with streaming reads, resumable writes and pluggable HTTPS"
+
+[features]
+default = []
+ureq = ["dep:ureq"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+ureq = { version = "3", optional = true, default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+futures-executor = "0.3"
+
+[[example]]
+name = "list"
+required-features = ["ureq"]
+
+[[example]]
+name = "upload"
+required-features = ["ureq"]
