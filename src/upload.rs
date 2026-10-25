@@ -8,7 +8,7 @@ use alloc::{
     string::{String, ToString},
     vec,
 };
-use core::{fmt, marker::PhantomData};
+use core::{cell::Cell, fmt, marker::PhantomData};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
@@ -99,15 +99,149 @@ pub enum UploadOutcome {
     Complete(File),
 }
 
-impl<T: UploadTransport> Client<T> {
-    /// Create a blob file. Initialization allocates only the small JSON metadata.
-    pub async fn create_upload(
-        &mut self,
+/// Initialization metadata is small and owned. Use `body` as the streamed
+/// request source, then accept the borrowed response inside an HTTP callback.
+pub struct PreparedUploadStart {
+    request: Request,
+    metadata: alloc::vec::Vec<u8>,
+    total: Option<u64>,
+    file_id: Option<String>,
+    remaining: Cell<u64>,
+    accepted: Cell<bool>,
+}
+impl PreparedUploadStart {
+    pub fn request(&self) -> &Request {
+        &self.request
+    }
+    pub fn length(&self) -> u64 {
+        self.metadata.len() as u64
+    }
+    pub fn body<'a, E: 'a>(&'a self) -> UploadBody<'a, impl Body<Error = E> + 'a> {
+        UploadBody {
+            source: SliceBody(&self.metadata, PhantomData),
+            remaining: &self.remaining,
+        }
+    }
+    pub async fn accept<B: Body>(
+        &self,
+        response: Response<B>,
+    ) -> Result<UploadSession, Error<B::Error>> {
+        if self.accepted.replace(true) {
+            return Err(Error::InvalidResponse("upload response already accepted"));
+        }
+        if response.status != 200 {
+            return Err(Error::Http(response.status));
+        }
+        if self.remaining.get() != 0 {
+            return Err(Error::InvalidResponse("transport did not send metadata"));
+        }
+        let location = Zeroizing::new(
+            response
+                .header("location")
+                .map_err(Error::InvalidResponse)?
+                .ok_or(Error::InvalidResponse("missing upload Location"))?
+                .to_string(),
+        );
+        let location_id = validate_url(&location)
+            .map_err(|_| Error::InvalidResponse("invalid upload Location"))?;
+        if self
+            .file_id
+            .as_deref()
+            .zip(location_id.as_deref())
+            .is_some_and(|(a, b)| a != b)
+        {
+            return Err(Error::InvalidResponse(
+                "upload Location file identity mismatch",
+            ));
+        }
+        empty(response).await?;
+        Ok(UploadSession {
+            url: location,
+            total: self.total,
+            confirmed: 0,
+            sent: Some(0),
+            needs_probe: false,
+            finished: false,
+            expired: false,
+            file_id: self.file_id.clone().or(location_id),
+        })
+    }
+}
+
+/// A prepared write or status probe borrows the session until dropped. Preparing
+/// marks its outcome uncertain: cancellation, a lost response, or dropping the
+/// operation requires a probe before another write. No request is replayed.
+pub struct PreparedUpload<'s> {
+    request: Request,
+    session: Cell<Option<&'s mut UploadSession>>,
+    length: u64,
+    remaining: Cell<u64>,
+    accepted: Cell<bool>,
+    limit: usize,
+}
+impl PreparedUpload<'_> {
+    pub fn request(&self) -> &Request {
+        &self.request
+    }
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+    /// Forward at most the declared length without collecting the source.
+    /// Response acceptance verifies that every declared byte was consumed.
+    pub fn body<B: Body>(&self, source: B) -> UploadBody<'_, B> {
+        UploadBody {
+            source,
+            remaining: &self.remaining,
+        }
+    }
+    pub async fn accept<B: Body>(
+        &self,
+        response: Response<B>,
+    ) -> Result<UploadOutcome, Error<B::Error>> {
+        if self.accepted.replace(true) {
+            return Err(Error::InvalidResponse("upload response already accepted"));
+        }
+        if matches!(response.status, 200 | 201 | 308) && self.remaining.get() != 0 {
+            return Err(Error::InvalidResponse(
+                "request body was not fully consumed",
+            ));
+        }
+        finish(
+            response,
+            self.session.take().expect("one response per operation"),
+            self.limit,
+        )
+        .await
+    }
+}
+
+/// A source window belonging to a prepared upload. This forwards reads directly
+/// into the caller's buffer and records consumption for response validation.
+pub struct UploadBody<'a, B> {
+    source: B,
+    remaining: &'a Cell<u64>,
+}
+impl<B: Body> Body for UploadBody<'_, B> {
+    type Error = B::Error;
+    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
+        let cap = self.remaining.get().min(buffer.len() as u64) as usize;
+        if cap == 0 {
+            return Ok(0);
+        }
+        let n = self.source.read(&mut buffer[..cap]).await?;
+        self.remaining.set(self.remaining.get() - n as u64);
+        Ok(n)
+    }
+}
+
+impl<T> Client<T> {
+    pub fn prepare_create_upload(
+        &self,
         file: NewFile<'_>,
         total: Option<u64>,
-    ) -> Result<UploadSession, Error<T::Error>> {
+    ) -> Result<PreparedUploadStart, InvalidInput> {
         if file.name.is_empty() {
-            return Err(InvalidInput("file name is empty").into());
+            return Err(InvalidInput("file name is empty"));
         }
         if let Some(parent) = file.parent {
             identifier(parent)?;
@@ -125,36 +259,31 @@ impl<T: UploadTransport> Client<T> {
             mime_type: file.mime_type,
             parents: file.parent.map(|p| [p]),
         })
-        .map_err(|_| Error::Json)?;
-        self.start_upload(None, file.mime_type, total, &metadata)
-            .await
+        .map_err(|_| InvalidInput("invalid upload metadata"))?;
+        self.prepare_start_upload(None, file.mime_type, total, metadata)
     }
-    /// Replace the complete content of an existing blob. Drive does not provide
-    /// random in-place writes; stage edits locally before replacing the object.
-    pub async fn update_upload(
-        &mut self,
+    pub fn prepare_update_upload(
+        &self,
         file_id: &str,
         mime_type: &str,
         total: Option<u64>,
-    ) -> Result<UploadSession, Error<T::Error>> {
+    ) -> Result<PreparedUploadStart, InvalidInput> {
         identifier(file_id)?;
-        self.start_upload(Some(file_id), mime_type, total, b"{}")
-            .await
+        self.prepare_start_upload(Some(file_id), mime_type, total, b"{}".to_vec())
     }
-    async fn start_upload(
-        &mut self,
+    fn prepare_start_upload(
+        &self,
         file_id: Option<&str>,
         mime_type: &str,
         total: Option<u64>,
-        metadata: &[u8],
-    ) -> Result<UploadSession, Error<T::Error>> {
-        // Header-safe media type. Google Workspace conversion is outside this API.
+        metadata: alloc::vec::Vec<u8>,
+    ) -> Result<PreparedUploadStart, InvalidInput> {
         if mime_type.is_empty()
             || !mime_type.bytes().all(|b| (0x21..=0x7e).contains(&b))
             || !mime_type.contains('/')
             || mime_type.starts_with("application/vnd.google-apps.")
         {
-            return Err(InvalidInput("invalid blob media type").into());
+            return Err(InvalidInput("invalid blob media type"));
         }
         let path = file_id.map(|id| format!("/{id}")).unwrap_or_default();
         let mut request = self.request(
@@ -179,48 +308,133 @@ impl<T: UploadTransport> Client<T> {
                 .extra
                 .push(("X-Upload-Content-Length", total.to_string()));
         }
-        let mut body = SliceBody::<T::Error>(metadata, PhantomData);
-        let response = self
-            .transport
-            .send_body(&request, &mut body)
-            .await
-            .map_err(Error::Transport)?;
-        if response.status != 200 {
-            return Err(Error::Http(response.status));
-        }
-        if !body.0.is_empty() {
-            return Err(Error::InvalidResponse("transport did not send metadata"));
-        }
-        let location = Zeroizing::new(
-            response
-                .header("location")
-                .map_err(Error::InvalidResponse)?
-                .ok_or(Error::InvalidResponse("missing upload Location"))?
-                .to_string(),
-        );
-        let location_id = validate_url(&location)
-            .map_err(|_| Error::InvalidResponse("invalid upload Location"))?;
-        if file_id
-            .zip(location_id.as_deref())
-            .is_some_and(|(a, b)| a != b)
-        {
-            return Err(Error::InvalidResponse(
-                "upload Location file identity mismatch",
-            ));
-        }
-        empty(response).await?;
-        Ok(UploadSession {
-            url: location,
+        Ok(PreparedUploadStart {
+            request,
+            remaining: Cell::new(metadata.len() as u64),
+            metadata,
             total,
-            confirmed: 0,
-            sent: Some(0),
-            needs_probe: false,
-            finished: false,
-            expired: false,
-            file_id: file_id.map(String::from).or(location_id),
+            file_id: file_id.map(String::from),
+            accepted: Cell::new(false),
         })
     }
+    /// Prepare one exact source window. This changes the session to require a
+    /// probe until a valid response is accepted, even if the operation is dropped.
+    pub fn prepare_write_stream<'s>(
+        &self,
+        session: &'s mut UploadSession,
+        length: u64,
+        is_final: bool,
+    ) -> Result<PreparedUpload<'s>, InvalidInput> {
+        session.active()?;
+        if session.needs_probe {
+            return Err(InvalidInput("probe upload status before writing"));
+        }
+        let end = session
+            .confirmed
+            .checked_add(length)
+            .ok_or(InvalidInput("upload size overflow"))?;
+        if !is_final && (length == 0 || !length.is_multiple_of(UPLOAD_ALIGNMENT)) {
+            return Err(InvalidInput("nonfinal chunk must be a multiple of 256 KiB"));
+        }
+        if length == 0 && (session.confirmed != 0 || !is_final) {
+            return Err(InvalidInput(
+                "only an empty file can have a zero length final request",
+            ));
+        }
+        if let Some(total) = session.total {
+            if end > total || (is_final && end != total) || (!is_final && end == total) {
+                return Err(InvalidInput("chunk does not match the declared total"));
+            }
+        }
+        if is_final {
+            session.total = Some(end);
+        }
+        let total = session
+            .total
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "*".into());
+        let range = if length == 0 {
+            format!("bytes */{total}")
+        } else {
+            format!("bytes {}-{}/{total}", session.confirmed, end - 1)
+        };
+        let request = self.upload_request(session, length, range);
+        session.needs_probe = true;
+        session.sent = Some(session.sent.unwrap_or(0).max(end));
+        Ok(PreparedUpload {
+            request,
+            session: Cell::new(Some(session)),
+            length,
+            remaining: Cell::new(length),
+            accepted: Cell::new(false),
+            limit: self.json_limit,
+        })
+    }
+    pub fn prepare_query_upload<'s>(
+        &self,
+        session: &'s mut UploadSession,
+    ) -> Result<PreparedUpload<'s>, InvalidInput> {
+        session.active()?;
+        let total = session
+            .total
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "*".into());
+        let request = self.upload_request(session, 0, format!("bytes */{total}"));
+        session.needs_probe = true;
+        Ok(PreparedUpload {
+            request,
+            session: Cell::new(Some(session)),
+            length: 0,
+            remaining: Cell::new(0),
+            accepted: Cell::new(false),
+            limit: self.json_limit,
+        })
+    }
+    fn upload_request(&self, session: &UploadSession, length: u64, range: String) -> Request {
+        let mut request = self.request(session.url.to_string(), None);
+        request.method = Method::Put;
+        request.sensitive_url = true;
+        request.extra = vec![
+            ("Content-Length", length.to_string()),
+            ("Content-Range", range),
+        ];
+        request
+    }
+}
 
+impl<T: UploadTransport> Client<T> {
+    /// Create a blob file. Initialization allocates only the small JSON metadata.
+    pub async fn create_upload(
+        &mut self,
+        file: NewFile<'_>,
+        total: Option<u64>,
+    ) -> Result<UploadSession, Error<T::Error>> {
+        let operation = self.prepare_create_upload(file, total)?;
+        let mut body = operation.body::<T::Error>();
+        let response = self
+            .transport
+            .send_body(operation.request(), &mut body)
+            .await
+            .map_err(Error::Transport)?;
+        operation.accept(response).await
+    }
+    /// Replace the complete content of an existing blob. Drive does not provide
+    /// random in-place writes; stage edits locally before replacing the object.
+    pub async fn update_upload(
+        &mut self,
+        file_id: &str,
+        mime_type: &str,
+        total: Option<u64>,
+    ) -> Result<UploadSession, Error<T::Error>> {
+        let operation = self.prepare_update_upload(file_id, mime_type, total)?;
+        let mut body = operation.body::<T::Error>();
+        let response = self
+            .transport
+            .send_body(operation.request(), &mut body)
+            .await
+            .map_err(Error::Transport)?;
+        operation.accept(response).await
+    }
     /// Send a borrowed chunk without copying it. Keep/reload bytes starting at
     /// the confirmed offset if Drive acknowledges only part of the request.
     pub async fn write_chunk(
@@ -237,11 +451,8 @@ impl<T: UploadTransport> Client<T> {
         )
         .await
     }
-
-    /// Stream exactly `length` bytes from a source positioned at session.offset().
-    /// A single final request can stream a whole file with bounded memory and
-    /// minimal HTTP overhead. A nonfinal request must be a multiple of 256 KiB.
-    /// On errors or cancellation, probe before seeking/replaying the source.
+    /// Stream exactly length bytes, probing after errors or cancellation before
+    /// replaying any source bytes.
     pub async fn write_stream<B: Body<Error = T::Error>>(
         &mut self,
         session: &mut UploadSession,
@@ -249,89 +460,28 @@ impl<T: UploadTransport> Client<T> {
         length: u64,
         is_final: bool,
     ) -> Result<UploadOutcome, Error<T::Error>> {
-        session.active()?;
-        if session.needs_probe {
-            return Err(InvalidInput("probe upload status before writing").into());
-        }
-        let end = session
-            .confirmed
-            .checked_add(length)
-            .ok_or(InvalidInput("upload size overflow"))?;
-        if !is_final && (length == 0 || !length.is_multiple_of(UPLOAD_ALIGNMENT)) {
-            return Err(InvalidInput("nonfinal chunk must be a multiple of 256 KiB").into());
-        }
-        if length == 0 && (session.confirmed != 0 || !is_final) {
-            return Err(
-                InvalidInput("only an empty file can have a zero length final request").into(),
-            );
-        }
-        if let Some(total) = session.total {
-            if end > total || (is_final && end != total) || (!is_final && end == total) {
-                return Err(InvalidInput("chunk does not match the declared total").into());
-            }
-        }
-        if is_final {
-            session.total = Some(end);
-        }
-        let total = session
-            .total
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "*".into());
-        let range = if length == 0 {
-            format!("bytes */{total}")
-        } else {
-            format!("bytes {}-{}/{total}", session.confirmed, end - 1)
-        };
-        let request = self.upload_request(session, length, range);
-        let mut limited = Limited {
-            source,
-            remaining: length,
-        };
-        // Set before awaiting: dropping the future leaves an uncertain session.
-        session.needs_probe = true;
-        session.sent = Some(session.sent.unwrap_or(0).max(end));
+        let operation = self.prepare_write_stream(session, length, is_final)?;
+        let mut body = operation.body(source);
         let response = self
             .transport
-            .send_body(&request, &mut limited)
+            .send_body(operation.request(), &mut body)
             .await
             .map_err(Error::Transport)?;
-        if matches!(response.status, 200 | 201 | 308) && limited.remaining != 0 {
-            return Err(Error::InvalidResponse(
-                "request body was not fully consumed",
-            ));
-        }
-        finish(response, session, self.json_limit).await
+        operation.accept(response).await
     }
-
     /// Recover after a lost response, cancellation, restart or token renewal.
     /// No automatic retries: the caller controls backoff and source replay.
     pub async fn query_upload(
         &mut self,
         session: &mut UploadSession,
     ) -> Result<UploadOutcome, Error<T::Error>> {
-        session.active()?;
-        let total = session
-            .total
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "*".into());
-        let request = self.upload_request(session, 0, format!("bytes */{total}"));
-        session.needs_probe = true;
+        let operation = self.prepare_query_upload(session)?;
         let response = self
             .transport
-            .send_body(&request, &mut SliceBody(&[], PhantomData))
+            .send_body(operation.request(), &mut SliceBody(&[], PhantomData))
             .await
             .map_err(Error::Transport)?;
-        finish(response, session, self.json_limit).await
-    }
-    fn upload_request(&self, session: &UploadSession, length: u64, range: String) -> Request {
-        let mut request = self.request(session.url.to_string(), None);
-        request.method = Method::Put;
-        request.sensitive_url = true;
-        request.extra = vec![
-            ("Content-Length", length.to_string()),
-            ("Content-Range", range),
-        ];
-        request
+        operation.accept(response).await
     }
 }
 
@@ -460,22 +610,6 @@ impl<E> Body for SliceBody<'_, E> {
         let n = self.0.len().min(buffer.len());
         buffer[..n].copy_from_slice(&self.0[..n]);
         self.0 = &self.0[n..];
-        Ok(n)
-    }
-}
-struct Limited<'a, B> {
-    source: &'a mut B,
-    remaining: u64,
-}
-impl<B: Body> Body for Limited<'_, B> {
-    type Error = B::Error;
-    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
-        let cap = self.remaining.min(buffer.len() as u64) as usize;
-        if cap == 0 {
-            return Ok(0);
-        }
-        let n = self.source.read(&mut buffer[..cap]).await?;
-        self.remaining -= n as u64;
         Ok(n)
     }
 }

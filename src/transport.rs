@@ -14,6 +14,15 @@ pub trait Body {
     async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error>;
 }
 
+/// Borrow a response/source body inside a transport callback without collecting
+/// it or transferring ownership out of the callback.
+impl<B: Body + ?Sized> Body for &mut B {
+    type Error = B::Error;
+    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
+        B::read(self, buffer).await
+    }
+}
+
 pub trait Transport {
     type Error;
     type Body<'a>: Body<Error = Self::Error>
