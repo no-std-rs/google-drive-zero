@@ -90,6 +90,64 @@ in-place writes are unavailable. A filesystem integration must stage edits.
 Google Workspace document conversion/export, sync, caching and filesystem
 mounts are outside this crate's scope.
 
+## Callback-based transports
+
+Use `Client::new((), token)` and `prepare_*` when your HTTP driver owns a TLS
+connection and lends its response body only inside a callback. Preparation does
+no network I/O. Each operation exposes `request()` and an `accept` method, so
+both transport styles use the same request builder and response validation.
+The existing `Transport`/`UploadTransport` API remains available.
+
+For example, prepare a range with `prepare_read_range` or
+`prepare_read_revision_range`. Build the HTTP request from `operation.request()`;
+inside its response callback, pass the borrowed body to this helper:
+
+```rust
+use google_drive_zero::{Error, PreparedRange, transport::{Body, Response}};
+use alloc::{string::String, vec::Vec};
+extern crate alloc;
+
+async fn accept_range<B: Body>(
+    operation: &PreparedRange,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: &mut B,
+    mut consume: impl FnMut(&[u8]),
+) -> Result<(), Error<B::Error>> {
+    let mut stream = operation.accept(Response { status, headers, body })?;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let n = stream.read(&mut buffer).await?;
+        if n == 0 { break; }
+        consume(&buffer[..n]);
+    }
+    Ok(())
+}
+```
+
+`prepare_list` and `prepare_metadata` return a `PreparedJson` whose async
+`accept` method decodes the same bounded metadata response. Header duplicates,
+status codes, range clipping, declared lengths, encoding and exact EOF have the
+same rules for borrowed and owned bodies. Keep the HTTP connection alive while
+the callback runs; its driver must close/invalidate it when the callback fails
+or is cancelled. Never publish partial bytes after a failed or cancelled read.
+
+For uploads, `prepare_create_upload` and `prepare_update_upload` return a
+`PreparedUploadStart`. Stream its `body::<YourTransportError>()` as the request
+source, using `length()` as Content-Length, then call `accept` in the response
+callback to obtain an `UploadSession`. A prepared write comes from
+`prepare_write_stream(&mut session, length, is_final)`; stream its `body(source)`
+wrapper and call `accept` for the `UploadOutcome`. The wrapper forwards reads
+without a payload allocation and records consumption, so a successful HTTP
+response cannot hide an incomplete source. One prepared upload represents one
+attempt; do not replay it or call its response acceptor twice.
+
+Preparing a write or `prepare_query_upload` borrows the session and immediately
+marks it uncertain. After dropping a cancelled or unused write, use a new
+`prepare_query_upload` operation before replaying bytes. Only its validated
+acknowledgement clears probe-required state and advances the confirmed offset.
+This also applies when cancellation occurs while reading a response body.
+
 ## Transport and credentials
 
 Implement `transport::Body` and `Transport`; add `UploadTransport` for writes.

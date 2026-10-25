@@ -567,3 +567,121 @@ fn transport_can_borrow_its_connection_for_a_response() {
         assert_eq!(drive.metadata("id").await.unwrap().name, "hello");
     });
 }
+
+#[test]
+fn prepared_operations_accept_borrowed_callback_bodies() {
+    block_on(async {
+        // No Transport implementation or owned response stream is needed.
+        let mut drive = Client::new((), "callback-token").unwrap();
+        drive.set_json_limit(1024).unwrap();
+        let operation = drive.prepare_metadata("file-1").unwrap();
+        let request = operation.request();
+        assert!(request.url().contains("/files/file-1?"));
+        assert!(!format!("{request:?}").contains("callback-token"));
+        let mut response = reply(200, &[], FILE);
+        let file = operation
+            .accept(Response {
+                status: response.status,
+                headers: response.headers,
+                body: &mut response.body,
+            })
+            .await
+            .unwrap();
+        assert_eq!(file.size, Some(5_368_709_121));
+        assert!(response.body.bytes.is_empty());
+
+        let operation = drive
+            .prepare_read_revision_range("file-1", "rev_2", ByteRange::new(512, 10).unwrap())
+            .unwrap();
+        let request = operation.request();
+        assert!(request.url().contains("/revisions/rev_2?alt=media"));
+        let bytes = [0, 255, 1, 0, 128, 19, 42, 254, 10, 99];
+        let mut response = reply(
+            206,
+            &[
+                ("Content-Range", "bytes 512-521/1000"),
+                ("Content-Length", "10"),
+            ],
+            &bytes,
+        );
+        let calls = response.body.calls.clone();
+        let download = operation
+            .accept(Response {
+                status: response.status,
+                headers: response.headers,
+                body: &mut response.body,
+            })
+            .unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            0,
+            "accepting headers must leave the body lazy"
+        );
+        assert_eq!(collect(download).await.unwrap(), bytes);
+        assert!(response.body.bytes.is_empty());
+        // The request remains usable throughout the callback without borrowing
+        // the response stream or moving the operation out of its owner.
+        assert!(request
+            .headers()
+            .any(|(k, v)| k == "Range" && v == "bytes=512-521"));
+    });
+}
+
+#[test]
+fn prepared_callback_responses_keep_limits_redirects_and_exact_eof() {
+    block_on(async {
+        let mut drive = Client::new((), "token").unwrap();
+        drive.set_json_limit(3).unwrap();
+        for (status, headers, bytes, expected) in [
+            (
+                302,
+                vec![("Location", "https://other.invalid")],
+                b"".as_slice(),
+                Error::Http(302),
+            ),
+            (
+                200,
+                vec![("Content-Length", "10")],
+                b"{}".as_slice(),
+                Error::BodyTooLarge,
+            ),
+            (
+                200,
+                vec![("Content-Length", "3")],
+                b"{}".as_slice(),
+                Error::InvalidResponse("metadata Content-Length mismatch"),
+            ),
+        ] {
+            let operation = drive.prepare_metadata("file-1").unwrap();
+            let mut response = reply(status, &headers, bytes);
+            assert_eq!(
+                operation
+                    .accept(Response {
+                        status,
+                        headers: response.headers,
+                        body: &mut response.body
+                    })
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+        }
+        for bytes in [b"abc".as_slice(), b"abcde"] {
+            let operation = drive
+                .prepare_read_range("file-1", ByteRange::new(0, 4).unwrap())
+                .unwrap();
+            let mut response = reply(206, &[("Content-Range", "bytes 0-3/4")], bytes);
+            let download = operation
+                .accept(Response {
+                    status: response.status,
+                    headers: response.headers,
+                    body: &mut response.body,
+                })
+                .unwrap();
+            assert!(matches!(
+                collect(download).await,
+                Err(Error::InvalidResponse(_))
+            ));
+        }
+    });
+}

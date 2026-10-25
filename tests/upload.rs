@@ -593,3 +593,192 @@ fn unknown_nonfinal_request_cannot_complete_and_bad_inputs_never_send() {
         assert!(session.needs_probe());
     });
 }
+
+fn borrowed(response: &mut Response<Bytes>) -> Response<&mut Bytes> {
+    Response {
+        status: response.status,
+        headers: response.headers.clone(),
+        body: &mut response.body,
+    }
+}
+async fn consume<B: Body<Error = Failure>>(source: &mut B) -> Result<Vec<u8>, Failure> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 19];
+    loop {
+        let n = source.read(&mut buffer).await?;
+        if n == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&buffer[..n]);
+    }
+}
+
+#[test]
+fn prepared_uploads_share_bounded_sources_and_borrow_callback_responses() {
+    block_on(async {
+        let drive = Client::new((), "callback-token").unwrap();
+        let operation = drive
+            .prepare_create_upload(
+                NewFile {
+                    name: "binary",
+                    mime_type: "application/octet-stream",
+                    parent: None,
+                },
+                Some(5),
+            )
+            .unwrap();
+        let request = operation.request();
+        assert_eq!(request.method(), Method::Post);
+        let mut source = operation.body::<Failure>();
+        let metadata = consume(&mut source).await.unwrap();
+        assert_eq!(metadata.len() as u64, operation.length());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&metadata).unwrap()["name"],
+            "binary"
+        );
+        let mut response = init();
+        let mut session = operation.accept(borrowed(&mut response)).await.unwrap();
+        assert_eq!(request.method(), Method::Post);
+        assert!(!session.needs_probe());
+        // The same operation cannot accidentally create a second session.
+        assert!(operation.accept(borrowed(&mut response)).await.is_err());
+
+        let operation = drive.prepare_write_stream(&mut session, 5, true).unwrap();
+        let request = operation.request();
+        let mut bytes = Bytes([0, 255, 128, 1, 0, 99].into());
+        let mut source = operation.body(&mut bytes);
+        assert_eq!(consume(&mut source).await.unwrap(), [0, 255, 128, 1, 0]);
+        assert_eq!(operation.length(), 5);
+        let mut response = complete(5);
+        assert!(matches!(
+            operation.accept(borrowed(&mut response)).await.unwrap(),
+            UploadOutcome::Complete(_)
+        ));
+        assert!(request
+            .headers()
+            .any(|(k, v)| k == "Content-Range" && v == "bytes 0-4/5"));
+        assert!(operation.accept(borrowed(&mut response)).await.is_err());
+        assert_eq!(bytes.0, [99]);
+        drop(operation);
+        assert!(session.is_complete());
+        assert_eq!(session.offset(), 5);
+    });
+}
+
+#[test]
+fn prepared_cancelled_short_or_failed_sources_require_probe() {
+    block_on(async {
+        let drive = Client::new((), "token").unwrap();
+        for mode in ["short", "error", "cancel"] {
+            let mut session = UploadSession::resume(URL, Some(3)).unwrap();
+            let probe = drive.prepare_query_upload(&mut session).unwrap();
+            probe
+                .accept(borrowed(&mut reply(308, &[], b"")))
+                .await
+                .unwrap();
+            drop(probe);
+            let operation = drive.prepare_write_stream(&mut session, 3, true).unwrap();
+            let mut generated = generated(2);
+            generated.fail = mode == "error";
+            generated.pending = mode == "cancel";
+            let mut source = operation.body(&mut generated);
+            if mode == "cancel" {
+                let mut buffer = [0; 8];
+                let mut future = Box::pin(source.read(&mut buffer));
+                assert!(matches!(
+                    future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Pending
+                ));
+            } else {
+                let result = consume(&mut source).await;
+                assert_eq!(result.is_err(), mode == "error");
+                assert!(matches!(
+                    operation.accept(borrowed(&mut complete(3))).await,
+                    Err(Error::InvalidResponse(
+                        "request body was not fully consumed"
+                    ))
+                ));
+            }
+            drop(operation);
+            assert!(session.needs_probe());
+            assert!(!session.is_complete());
+            assert!(drive.prepare_write_stream(&mut session, 3, true).is_err());
+            let operation = drive.prepare_query_upload(&mut session).unwrap();
+            assert!(matches!(
+                operation.accept(borrowed(&mut ack(1))).await.unwrap(),
+                UploadOutcome::Incomplete { confirmed: 1 }
+            ));
+            drop(operation);
+            assert_eq!(session.offset(), 1);
+            assert!(!session.needs_probe());
+        }
+    });
+}
+
+#[test]
+fn dropping_a_prepared_write_before_io_also_requires_probe() {
+    let drive = Client::new((), "token").unwrap();
+    let mut session = UploadSession::resume(URL, Some(3)).unwrap();
+    block_on(
+        drive
+            .prepare_query_upload(&mut session)
+            .unwrap()
+            .accept(borrowed(&mut reply(308, &[], b""))),
+    )
+    .unwrap();
+    assert!(!session.needs_probe());
+    drop(drive.prepare_write_stream(&mut session, 3, true).unwrap());
+    assert!(session.needs_probe());
+}
+
+#[test]
+fn cancelling_prepared_response_acceptance_keeps_the_session_uncertain() {
+    struct Pending;
+    impl Body for Pending {
+        type Error = Failure;
+        async fn read(&mut self, _: &mut [u8]) -> Result<usize, Failure> {
+            core::future::pending().await
+        }
+    }
+    block_on(async {
+        let drive = Client::new((), "token").unwrap();
+        let mut session = UploadSession::resume(URL, Some(3)).unwrap();
+        drive
+            .prepare_query_upload(&mut session)
+            .unwrap()
+            .accept(borrowed(&mut reply(308, &[], b"")))
+            .await
+            .unwrap();
+        let operation = drive.prepare_write_stream(&mut session, 3, true).unwrap();
+        let mut source = operation.body(generated(3));
+        assert_eq!(consume(&mut source).await.unwrap().len(), 3);
+        {
+            let mut pending = Pending;
+            let mut future = Box::pin(operation.accept(Response {
+                status: 201,
+                headers: vec![],
+                body: &mut pending,
+            }));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
+        }
+        assert!(operation.accept(borrowed(&mut complete(3))).await.is_err());
+        drop(operation);
+        assert!(session.needs_probe());
+        assert!(!session.is_complete());
+        assert_eq!(session.offset(), 0);
+        drive
+            .prepare_query_upload(&mut session)
+            .unwrap()
+            .accept(borrowed(&mut complete(3)))
+            .await
+            .unwrap();
+        assert!(session.is_complete());
+    });
+}

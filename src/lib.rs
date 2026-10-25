@@ -16,10 +16,13 @@ mod stream;
 pub mod transport;
 mod upload;
 
-pub use client::{Client, ListOptions};
+pub use client::{Client, ListOptions, PreparedJson, PreparedRange};
 pub use models::{Capabilities, File, FilePage};
 pub use stream::{ByteRange, Download};
-pub use upload::{NewFile, UploadOutcome, UploadSession, UPLOAD_ALIGNMENT};
+pub use upload::{
+    NewFile, PreparedUpload, PreparedUploadStart, UploadBody, UploadOutcome, UploadSession,
+    UPLOAD_ALIGNMENT,
+};
 
 use core::fmt;
 
